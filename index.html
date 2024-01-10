@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Document</title>
+</head>
+<body>
+<div class="header">
+    <span>上传需要转换的视频(只支持h264编码的视频)：</span>
+    <input type="file" id="upload" class="input" accept="video/*"/>
+    <span id="loading"></span>
+    <input type="button" value="生成Gif" id="genGif">
+    <span id="parsing"></span>
+    <input type="button" value="下载Gif" id="downloadGif">
+</div>
+<div class="attributes">
+    <div>Gif参数设置:</div>
+    <label> 生成质量：
+        <input type="number" value="1" min="1" max="10" id="quality">
+    </label>
+    <label title="1-10,即为每几帧抽一帧作为gif的帧"> 抽帧比例：
+        <input type="number" value="10" min="1" max="10" id="space">
+    </label>
+    <label>帧率： 
+        <input type="number" value="10" min="1" max="30" id="fps">
+    </label>
+    <label>是否重复：
+        <input type="checkbox" id="repeat" checked>
+    </label>
+
+    <label>缩放比例：
+        <input type="number" id="scale" step="0.1" value="0.5" min="0.1" max="1">
+    </label>
+    <label>是否开启调试模式(控制台输出进度)：
+        <input type="checkbox" id="debug">
+    </label>
+    <span>注意：GIF参数越精确，则生成时间越长，打开调试模式可查看进度</span>
+</div>
+<div class="media">
+    <div class="title">原视频：</div>
+    <video controls src="" class="originVideo" id="originVideo"></video>
+    <div class="title">生成结果：</div>
+    <img src='' id="img" alt="" class="gif"/>
+</div>
+
+
+</body>
+<style>
+    .header {
+        display: flex;
+        margin-bottom: 20px;
+        gap: 20px;
+    }
+
+    .media {
+        margin: 20px 0;
+        flex-wrap: wrap;
+    }
+
+    .originVideo {
+        height: 400px;
+        margin-right: 20px;
+    }
+
+
+    .title {
+        margin: 10px 0;
+        font-weight: bold;
+    }
+
+    .attributes {
+        display: flex;
+        gap: 20px;
+        flex-wrap: wrap;
+    }
+</style>
+<script type="text/javascript" src="mp4box.all.js"></script>
+<script type="text/javascript" src="gif.js"></script>
+<script type="text/javascript" src="gif.worker.js"></script>
+<script>
+    const uploadVideo = document.getElementById('upload')
+    const img = document.getElementById('img')
+    const canvas = document.createElement('canvas')
+    const progress = document.getElementById('progress')
+    const download = document.getElementById('downloadGif')
+    const originVideo = document.getElementById('originVideo')
+    const genGif = document.getElementById('genGif')
+    const parsing = document.getElementById('parsing')
+    const loading = document.getElementById('loading')
+    const quality = document.getElementById('quality')
+    const repeat = document.getElementById('repeat')
+    const scale = document.getElementById('scale')
+    const space = document.getElementById('space')
+    const debug = document.getElementById('debug')
+    const fps =document.getElementById('fps')
+    const e = new Event('translated')
+    const ctx = canvas.getContext('2d', {
+        willReadFrequently: true,
+    })
+    let mp4box
+    let gif
+    let videoTrack
+    let videoDecoder = null;
+    let finished = false
+    let gifUrl = ''
+    let nbSampleTotal = 0;
+    let countSample = 0;
+    let filename = ''
+    let isLoaded = false
+    let fileBuffer
+    let videoFrames = [];
+    const getExtraData = (mp4box) => {
+        // 生成VideoDecoder.configure需要的description信息
+        const entry = mp4box.moov.traks[0].mdia.minf.stbl.stsd.entries[0];
+        const box = entry.avcC ?? entry.hvcC ?? entry.vpcC;
+        if (box != null) {
+            const stream = new DataStream(
+                undefined,
+                0,
+                DataStream.BIG_ENDIAN
+            )
+            box.write(stream)
+            // slice()方法的作用是移除moov box的header信息
+            return new Uint8Array(stream.buffer.slice(8))
+        }
+    };
+
+    download.onclick = () => {
+        if (finished) {
+            const a = document.createElement('a')
+            a.href = gifUrl
+            a.download = filename + '.gif'
+            a.click()
+            a.remove()
+        }
+    }
+    genGif.onclick = () => {
+        nbSampleTotal = 0;
+        countSample = 0;
+        parsing.innerText = ''
+        videoFrames = []
+        videoTrack = null
+        gif = null
+        mp4box = null
+        videoDecoder = null
+        console.log(videoFrames, videoTrack, gif, nbSampleTotal, mp4box)
+        if (!isLoaded) {
+            alert('视频还未加载完成！')
+            return
+        }
+        parsing.innerText = '正在转换中...'
+
+        mp4box = MP4Box.createFile()
+        console.log(mp4box)
+        mp4box.onReady = (info) => {
+            console.log(info)
+            videoTrack = info.videoTracks[0];
+            mp4box.setExtractionOptions(info.videoTracks[0]?.id, 'video', {
+                nbSamples: 100
+            })
+            // 视频的宽度和高度
+            const videoW = videoTrack.track_width;
+            const videoH = videoTrack.track_height;
+
+            canvas.width = videoW * scale.value
+            canvas.height = videoH * scale.value
+            // 设置视频解码器
+
+            videoDecoder = new VideoDecoder({
+                output: (videoFrame) => {
+                    createImageBitmap(videoFrame).then((img) => {
+                        videoFrames.push({
+                            img,
+                            duration: videoFrame.duration,
+                            timestamp: videoFrame.timestamp
+                        });
+                        if (videoFrames.length === nbSampleTotal) {
+                            console.log(videoFrames)
+                            e.data = videoFrames
+                            window.dispatchEvent(e)
+                        }
+                        videoFrame.close();
+                    });
+
+                },
+                error: (err) => {
+                    console.error('videoDecoder错误：', err);
+                }
+            });
+            nbSampleTotal = videoTrack.nb_samples;
+            console.log(videoFrames, videoTrack)
+            videoDecoder.configure({
+                codec: videoTrack.codec,
+                codedWidth: videoW,
+                codedHeight: videoH,
+                description: getExtraData(mp4box)
+            });
+            mp4box.start();
+        }
+        mp4box.onSamples = (trackId, ref, samples) => {
+            // mp4box.stop();
+            countSample += samples.length;
+            for (const sample of samples) {
+                const type = sample.is_sync ? 'key' : 'delta';
+                const chunk = new EncodedVideoChunk({
+                    type,
+                    timestamp: sample.cts,
+                    duration: sample.duration,
+                    data: sample.data
+                });
+
+                videoDecoder.decode(chunk);
+            }
+            // mp4box.start();
+            if (countSample === nbSampleTotal) {
+                videoDecoder.flush();
+            }
+
+        }
+        fileBuffer.fileStart = 0;
+        mp4box.appendBuffer(fileBuffer);
+    }
+    window.addEventListener('translated', async (e) => {
+        console.log(e)
+        gif = new GIF({
+            workers: 2,
+            quality: Number(quality.value),
+            repeat: !repeat.checked,
+            width: canvas.width,
+            height: canvas.height,
+            debug: debug.checked
+        });
+        gif.on('finished', function (blob) {
+            console.log('complete', gif)
+            gifUrl = URL.createObjectURL(blob)
+            img.src = gifUrl
+            finished = true
+            parsing.innerText = '转换成功！'
+        });
+        ctx.drawImage(e.data[0].img, 0, 0, canvas.width, canvas.height)
+        gif.addFrame(ctx, {copy: true, delay: 1000/Number(fps.value)})
+        for (let i = 1; i < e.data.length; i = i + Number(space.value)) {
+            ctx.drawImage(e.data[i].img, 0, 0, canvas.width, canvas.height)
+            gif.addFrame(ctx, {copy: true, delay: 1000/Number(fps.value)})
+        }
+        gif.render()
+    })
+    uploadVideo.onchange = () => {
+
+        const file = uploadVideo.files[0]
+        // 获取视频的arraybuffer数据
+        loading.innerText = '视频正在加载中...'
+        const fr = new FileReader();
+        filename = file.name.substring(0, file.name.indexOf('.'))
+        fr.readAsArrayBuffer(file)
+        fr.onloadend = (e) => {
+            fileBuffer = e.target.result;
+            const blob = new Blob([fileBuffer])
+            originVideo.src = URL.createObjectURL(blob)
+            isLoaded = true
+            loading.innerText = '视频加载完成！'
+        }
+    }
+    // 这个是额外的处理方法，不需要关心里面的细节
+
+
+</script>
+</html>
